@@ -1,14 +1,11 @@
-#![cfg_attr(feature = "unstable", feature(asm, const_fn, generic_param_attrs, dropck_eyepatch))]
-
-#![no_std]
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![cfg_attr(feature = "unstable", feature(dropck_eyepatch))]
 
 #[cfg(test)]
 #[macro_use]
 extern crate lazy_static;
-#[cfg(test)]
-extern crate std;
 
 mod mutex;
 mod pause;
 
-pub use mutex::{Slot, Mutex, Guard};
+pub use mutex::{Mutex, MutexGuard, Slot};

@@ -1,6 +1,7 @@
 [package]
 name = "mcs"
-version = "0.1.1"
+version = "0.2.0"
+edition = "2021"
 authors = ["Jonathan S <gereeter+code@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/gereeter/mcs-rs"
@@ -13,7 +14,7 @@ queueing spinlock. This library is usable without `std`.
 
 [features]
 unstable = []
-default = ["unstable"]
+std = []
 
 [dev-dependencies]
-lazy_static = "0.2"
+lazy_static = "1"
