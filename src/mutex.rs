@@ -1,4 +1,5 @@
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr;
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering};
@@ -6,22 +7,22 @@ use core::sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering};
 use crate::pause::pause;
 
 pub struct Slot {
-    next: AtomicPtr<AtomicBool>,
+    next: MaybeUninit<AtomicPtr<AtomicBool>>,
 }
 
 impl Slot {
     pub const fn new() -> Slot {
-        Slot { next: AtomicPtr::new(ptr::null_mut()) }
+        Slot { next: MaybeUninit::uninit() }
     }
 }
 
 /// A mutual exclusion primitive useful for protecting shared data
 ///
 /// This mutex will block threads waiting for the lock to become available. The
-/// mutex can also be statically initialized or created via a `new`
+/// mutex can also be statically initialized or created via a [`new`]
 /// constructor. Each mutex has a type parameter which represents the data that
 /// it is protecting. The data can only be accessed through the RAII guards
-/// returned from `lock` and `try_lock`, which guarantees that the data is only
+/// returned from [`lock`] and [`try_lock`], which guarantees that the data is only
 /// ever accessed when the mutex is locked.
 ///
 /// # Examples
@@ -64,6 +65,9 @@ impl Slot {
 ///
 /// rx.recv().unwrap();
 /// ```
+/// [`new`]: Mutex::new
+/// [`lock`]: Mutex::lock
+/// [`try_lock`]: Mutex::try_lock
 pub struct Mutex<T: ?Sized> {
     queue: AtomicPtr<Slot>,
     data: UnsafeCell<T>,
@@ -91,14 +95,14 @@ impl<T> Mutex<T> {
 impl<T: ?Sized> Mutex<T> {
     /// Attempts to acquire this lock.
     ///
-    /// If the lock could not be acquired at this time, then `Err` is returned.
+    /// If the lock could not be acquired at this time, then [`None`] is returned.
     /// Otherwise, an RAII guard is returned. The lock will be unlocked when the
     /// guard is dropped.
     ///
     /// This function does not block.
     #[inline(always)]
     pub fn try_lock<'a>(&'a self, slot: &'a mut Slot) -> Option<MutexGuard<'a, T>> {
-        slot.next = AtomicPtr::new(ptr::null_mut());
+        slot.next.write(AtomicPtr::new(ptr::null_mut()));
 
         self.queue
             .compare_exchange(ptr::null_mut(), slot, Ordering::Acquire, Ordering::Relaxed)
@@ -114,13 +118,14 @@ impl<T: ?Sized> Mutex<T> {
     /// the guard goes out of scope, the mutex will be unlocked.
     #[inline(always)]
     pub fn lock<'a>(&'a self, slot: &'a mut Slot) -> MutexGuard<'a, T> {
-        slot.next = AtomicPtr::new(ptr::null_mut());
+        slot.next.write(AtomicPtr::new(ptr::null_mut()));
         let pred = self.queue.swap(slot, Ordering::AcqRel);
 
         if !pred.is_null() {
-            let pred = unsafe { &*pred };
             let locked = AtomicBool::new(true);
-            pred.next.store(&locked as *const _ as *mut _, Ordering::Release);
+            let next = unsafe { (*pred).next.assume_init_ref() };
+            next.store(&locked as *const _ as *mut _, Ordering::Release);
+
             while locked.load(Ordering::Relaxed) {
                 pause();
             }
@@ -133,7 +138,7 @@ impl<T: ?Sized> Mutex<T> {
     /// Returns a mutable reference to the underlying data.
     ///
     /// Since this call borrows the `Mutex` mutably, no actual locking needs to
-    /// take place---the mutable borrow statically guarantees no locks exist.
+    /// take place - the mutable borrow statically guarantees no locks exist.
     #[inline(always)]
     pub fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.get() }
@@ -141,7 +146,7 @@ impl<T: ?Sized> Mutex<T> {
 }
 
 impl<T: ?Sized + Default> Default for Mutex<T> {
-    /// Creates a `Mutex<T>`, with the `Default` value for T.
+    /// Creates a `Mutex<T>`, with the `Default` value for `T`.
     fn default() -> Mutex<T> {
         Mutex::new(Default::default())
     }
@@ -158,7 +163,7 @@ impl<T> From<T> for Mutex<T> {
 /// dropped (falls out of scope), the lock will be unlocked.
 ///
 /// The data protected by the mutex can be access through this guard via its
-/// `Deref` and `DerefMut` implementations.
+/// [`Deref`] and [`DerefMut`] implementations.
 #[must_use]
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     lock: &'a Mutex<T>,
@@ -186,11 +191,13 @@ impl<'a, T: ?Sized> DerefMut for MutexGuard<'a, T> {
 /// does not access anything that could be behind `T` (it does not access
 /// self.data at all here) during the drop call. So it is safe for `T` to be
 /// dangling by the time a instance of `MutexGuard` is dropped.
-macro_rules! guard_drop_impl {
+macro_rules! mutex_guard_drop_impl {
     () => {
         fn drop(&mut self) {
-            let mut succ = self.slot.next.load(Ordering::Relaxed);
-            if succ.is_null() {
+            let next = unsafe { self.slot.next.assume_init_ref() };
+            let mut locked_ptr = next.load(Ordering::Relaxed);
+
+            if locked_ptr.is_null() {
                 // No one has registered as waiting.
                 if self
                     .lock
@@ -210,8 +217,8 @@ macro_rules! guard_drop_impl {
                 // Some thread is waiting, but hasn't registered yet,
                 // so spin waiting for them to register themselves.
                 loop {
-                    succ = self.slot.next.load(Ordering::Relaxed);
-                    if !succ.is_null() {
+                    locked_ptr = next.load(Ordering::Relaxed);
+                    if !locked_ptr.is_null() {
                         break;
                     }
                     pause();
@@ -220,20 +227,20 @@ macro_rules! guard_drop_impl {
 
             // Announce to the next waiter that the lock is free.
             fence(Ordering::Acquire);
-            let succ = unsafe { &*succ };
-            succ.store(false, Ordering::Release);
+            let locked = unsafe { &*locked_ptr };
+            locked.store(false, Ordering::Release);
         }
     };
 }
 
 #[cfg(feature = "unstable")]
 unsafe impl<'a, #[may_dangle] T: ?Sized> Drop for MutexGuard<'a, T> {
-    guard_drop_impl!();
+    mutex_guard_drop_impl!();
 }
 
 #[cfg(not(feature = "unstable"))]
 impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
-    guard_drop_impl!();
+    mutex_guard_drop_impl!();
 }
 
 #[cfg(test)]
