@@ -15,17 +15,6 @@ impl Slot {
     }
 }
 
-/// An RAII implementation of a "scoped lock" of a mutex. When this structure is
-/// dropped (falls out of scope), the lock will be unlocked.
-///
-/// The data protected by the mutex can be access through this guard via its
-/// `Deref` and `DerefMut` implementations
-#[must_use]
-pub struct MutexGuard<'a, T: ?Sized + 'a> {
-    lock: &'a Mutex<T>,
-    slot: &'a Slot,
-}
-
 /// A mutual exclusion primitive useful for protecting shared data
 ///
 /// This mutex will block threads waiting for the lock to become available. The
@@ -87,7 +76,9 @@ impl<T> Mutex<T> {
     /// Creates a new mutex in an unlocked state ready for use.
     #[inline(always)]
     pub const fn new(value: T) -> Mutex<T> {
-        Mutex { queue: AtomicPtr::new(ptr::null_mut()), data: UnsafeCell::new(value) }
+        let queue = AtomicPtr::new(ptr::null_mut());
+        let data = UnsafeCell::new(value);
+        Mutex { queue, data }
     }
 
     /// Consumes this mutex, returning the underlying data.
@@ -149,8 +140,34 @@ impl<T: ?Sized> Mutex<T> {
     }
 }
 
+impl<T: ?Sized + Default> Default for Mutex<T> {
+    /// Creates a `Mutex<T>`, with the `Default` value for T.
+    fn default() -> Mutex<T> {
+        Mutex::new(Default::default())
+    }
+}
+
+impl<T> From<T> for Mutex<T> {
+    /// Creates a `Mutex<T>` from a instance of `T`.
+    fn from(data: T) -> Self {
+        Self::new(data)
+    }
+}
+
+/// An RAII implementation of a "scoped lock" of a mutex. When this structure is
+/// dropped (falls out of scope), the lock will be unlocked.
+///
+/// The data protected by the mutex can be access through this guard via its
+/// `Deref` and `DerefMut` implementations.
+#[must_use]
+pub struct MutexGuard<'a, T: ?Sized + 'a> {
+    lock: &'a Mutex<T>,
+    slot: &'a Slot,
+}
+
 impl<'a, T: ?Sized> Deref for MutexGuard<'a, T> {
     type Target = T;
+
     fn deref(&self) -> &T {
         unsafe { &*self.lock.data.get() }
     }
@@ -162,84 +179,61 @@ impl<'a, T: ?Sized> DerefMut for MutexGuard<'a, T> {
     }
 }
 
-// Unforturnately, since just putting attributes on generic parameters is unstable,
-// we have to duplicate the whole Drop impl
+/// `MutexGuard` unified `drop` implementation, used for both
+/// stable and unstable implementations.
+///
+/// `MutexGuard` does not own any `T` (so it will not drop any `T`) and it also
+/// does not access anything that could be behind `T` (it does not access
+/// self.data at all here) during the drop call. So it is safe for `T` to be
+/// dangling by the time a instance of `MutexGuard` is dropped.
+macro_rules! guard_drop_impl {
+    () => {
+        fn drop(&mut self) {
+            let mut succ = self.slot.next.load(Ordering::Relaxed);
+            if succ.is_null() {
+                // No one has registered as waiting.
+                if self
+                    .lock
+                    .queue
+                    .compare_exchange(
+                        self.slot as *const _ as *mut _,
+                        ptr::null_mut(),
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    // No one was waiting.
+                    return;
+                }
+
+                // Some thread is waiting, but hasn't registered yet,
+                // so spin waiting for them to register themselves.
+                loop {
+                    succ = self.slot.next.load(Ordering::Relaxed);
+                    if !succ.is_null() {
+                        break;
+                    }
+                    pause();
+                }
+            }
+
+            // Announce to the next waiter that the lock is free.
+            fence(Ordering::Acquire);
+            let succ = unsafe { &*succ };
+            succ.store(false, Ordering::Release);
+        }
+    };
+}
+
 #[cfg(feature = "unstable")]
 unsafe impl<'a, #[may_dangle] T: ?Sized> Drop for MutexGuard<'a, T> {
-    fn drop(&mut self) {
-        let mut succ = self.slot.next.load(Ordering::Relaxed);
-        if succ.is_null() {
-            // No one has registered as waiting.
-            if self
-                .lock
-                .queue
-                .compare_exchange(
-                    self.slot as *const _ as *mut _,
-                    ptr::null_mut(),
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                // No one was waiting.
-                return;
-            }
-
-            // Some thread is waiting, but hasn't registered yet,
-            // so spin waiting for them to register themselves.
-            loop {
-                succ = self.slot.next.load(Ordering::Relaxed);
-                if !succ.is_null() {
-                    break;
-                }
-                pause();
-            }
-        }
-
-        // Announce to the next waiter that the lock is free.
-        fence(Ordering::Acquire);
-        let succ = unsafe { &*succ };
-        succ.store(false, Ordering::Release);
-    }
+    guard_drop_impl!();
 }
 
 #[cfg(not(feature = "unstable"))]
 impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
-    fn drop(&mut self) {
-        let mut succ = self.slot.next.load(Ordering::Relaxed);
-        if succ.is_null() {
-            // No one has registered as waiting.
-            if self
-                .lock
-                .queue
-                .compare_exchange(
-                    self.slot as *const _ as *mut _,
-                    ptr::null_mut(),
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                // No one was waiting.
-                return;
-            }
-
-            // Some thread is waiting, but hasn't registered yet,
-            // so spin waiting for them to register themselves.
-            loop {
-                succ = self.slot.next.load(Ordering::Relaxed);
-                if !succ.is_null() {
-                    break;
-                }
-                pause();
-            }
-        }
-
-        // Announce to the next waiter that the lock is free.
-        fence(Ordering::Acquire);
-        let succ = unsafe { &*succ };
-        succ.store(false, Ordering::Release);
-    }
+    guard_drop_impl!();
 }
 
 #[cfg(test)]
